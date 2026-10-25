@@ -29,6 +29,8 @@ export class Rga {
   // All nodes in document order, including tombstones.
   private readonly nodes: Node[] = [];
   private readonly byId = new Map<string, Node>();
+  // Operations received before their dependency, keyed by operation id.
+  private readonly pending = new Map<string, Op>();
 
   constructor(siteId: SiteId) {
     this.siteId = siteId;
@@ -54,6 +56,11 @@ export class Rga {
     return this.nodes.length;
   }
 
+  // Operations waiting for a dependency. Should return to 0 once everything has arrived.
+  get pendingCount(): number {
+    return this.pending.size;
+  }
+
   // ---------- local edits: return the operation to send to others ----------
 
   insertAt(index: number, char: string): InsertOp {
@@ -68,7 +75,7 @@ export class Rga {
       origin: left ? left.id : null,
       char,
     };
-    this.integrateInsert(op);
+    this.integrate(op);
     return op;
   }
 
@@ -83,25 +90,26 @@ export class Rga {
       id: makeId(this.clock.tick(), this.siteId),
       target: target.id,
     };
-    target.deleted = true;
+    this.integrate(op);
     return op;
   }
 
   // ---------- remote operations ----------
 
-  // Apply an operation created elsewhere. Safe to call twice with the same op.
+  // Apply an operation created elsewhere. Safe to call any number of times with the same op,
+  // and in any order relative to other operations.
   apply(op: Op): void {
     this.clock.observe(op.id.counter);
-    if (op.type === "insert") {
-      if (this.byId.has(idKey(op.id))) return; // already applied (idempotent)
-      this.integrateInsert(op);
-    } else {
-      const target = this.byId.get(idKey(op.target));
-      if (target === undefined) {
-        throw new Error(`delete target ${idKey(op.target)} not found (causal buffering comes in step 6)`);
-      }
-      target.deleted = true; // deleting twice is harmless
+
+    if (op.type === "insert" && this.byId.has(idKey(op.id))) return; // already applied
+    if (this.pending.has(idKey(op.id))) return; // already waiting
+
+    if (!this.isReady(op)) {
+      this.pending.set(idKey(op.id), op);
+      return;
     }
+    this.integrate(op);
+    this.drainPending();
   }
 
   // ---------- internals ----------
@@ -110,12 +118,48 @@ export class Rga {
     return this.nodes.filter((n) => !n.deleted);
   }
 
+  private isReady(op: Op): boolean {
+    if (op.type === "insert") {
+      return op.origin === null || this.byId.has(idKey(op.origin));
+    }
+    return this.byId.has(idKey(op.target));
+  }
+
+  // Repeatedly apply any pending operation whose dependency has arrived.
+  private drainPending(): void {
+    let progressed = true;
+    while (progressed && this.pending.size > 0) {
+      progressed = false;
+      for (const [key, op] of this.pending) {
+        if (this.isReady(op)) {
+          this.pending.delete(key);
+          this.integrate(op);
+          progressed = true;
+        }
+      }
+    }
+  }
+
+  // Precondition: isReady(op) is true.
+  private integrate(op: Op): void {
+    if (op.type === "insert") this.integrateInsert(op);
+    else this.integrateDelete(op);
+  }
+
+  private integrateDelete(op: DeleteOp): void {
+    const target = this.byId.get(idKey(op.target));
+    if (target === undefined) {
+      throw new Error(`invariant violated: delete target ${idKey(op.target)} missing`);
+    }
+    target.deleted = true; // deleting twice is harmless
+  }
+
   private integrateInsert(op: InsertOp): void {
     let i = 0;
     if (op.origin !== null) {
       const originIndex = this.nodes.findIndex((n) => idEquals(n.id, op.origin as CharId));
       if (originIndex === -1) {
-        throw new Error(`insert origin ${idKey(op.origin)} not found (causal buffering comes in step 6)`);
+        throw new Error(`invariant violated: insert origin ${idKey(op.origin)} missing`);
       }
       i = originIndex + 1;
     }

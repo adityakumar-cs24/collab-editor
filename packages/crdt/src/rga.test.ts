@@ -102,10 +102,4 @@ describe("replication", () => {
     expect(bob.toString()).toBe("ac");
   });
 
-  it("currently throws when an operation arrives before its dependency (fixed in step 6)", () => {
-    const alice = new Rga("alice");
-    const bob = new Rga("bob");
-    const ops = type(alice, "ab");
-    expect(() => bob.apply(ops[1] as Op)).toThrow();
-  });
 });
