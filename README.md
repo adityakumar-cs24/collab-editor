@@ -11,6 +11,7 @@ Every claim below is backed by a test in this repository.
 - **A naive design provably fails.** An index-based implementation diverges on a two-user concurrent edit, silently, with no error (see "The problem").
 - **Convergence under random concurrency.** Property-based fuzzing simulates 3 and 10 replicas making random inserts and deletes, with out-of-order and duplicated delivery. Every replica ends with identical text, an empty pending buffer, and exactly one node per insert (nothing lost, nothing duplicated).
 - **Convergence through a real WebSocket server.** Two replicas type concurrently over real connections, end with identical text, and a third client that joins later rebuilds the same document from the server's history.
+- **Reconnect and offline editing against a real server.** Edits keep working while disconnected, and on rejoin only the operations the server is missing are resent. A randomized test runs three clients through random edits, offline periods and cut connections, and requires identical text and version vectors at the end.
 - **Delta sync with version vectors.** A client that rejoins sends what it already has and receives exactly the missing operations. A property test checks that any prefix of a random three-site history, plus the operations the server says are missing, reproduces the full document and an identical vector.
 - **Out-of-order delivery is handled.** Operations that arrive before their dependency are parked and applied automatically when it shows up. An 11-character chain delivered in reverse order still produces the right text.
 - **Idempotent operations.** Delivering the same operation repeatedly changes nothing, both in the CRDT and on the server.
@@ -20,14 +21,14 @@ Every claim below is backed by a test in this repository.
 
 ## Status: CRDT core, protocol, relay server and browser client implemented
 
-114 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
+136 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
 
 | Package | Tests | Covers |
 | --- | --- | --- |
 | `packages/crdt` | 36 | ids, clock, RGA, causal buffering, version vectors, multi-replica fuzzing |
 | `packages/protocol` | 30 | message validation, version vector validation, limits, round trip with a real replica |
-| `apps/server` | 24 | rooms, delta joins, forwarding, ordering and integrity checks, hostile input, end to end |
-| `apps/client` | 24 | text diffing, caret shifting, editor session against an in-memory server stand-in, join vectors |
+| `apps/server` | 26 | rooms, delta joins, forwarding, ordering and integrity checks, heartbeat, hostile input, end to end |
+| `apps/client` | 44 | text diffing, caret shifting, editor session and outbox, reconnect with backoff (fake socket and timers), real-server integration and randomized tests |
 
 ## Roadmap
 
@@ -41,7 +42,7 @@ Every claim below is backed by a test in this repository.
 - [x] WebSocket server: rooms, history, validated broadcast
 - [x] Browser client (textarea bound to a local replica)
 - [x] Version-vector delta sync
-- [ ] Reconnect and offline queue
+- [x] Reconnect with backoff, in-memory outbox, server heartbeat
 - [ ] Offline queue (IndexedDB)
 - [ ] Live cursors anchored to character ids
 - [ ] Persistence (PostgreSQL) and multi-instance fan-out (Redis)
@@ -132,6 +133,7 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 - A join is answered with only the operations above the client's vector, plus the server's vector.
 - Each document is capped at 50,000 operations (configurable), which keeps the history sent on join within the client's parse limit.
 - Binary frames are rejected, and `ws` closes any connection that sends more than 64 KB in one frame (close code 1009).
+- A heartbeat pings every connection (30 seconds by default) and terminates one that does not answer, which frees its `siteId` so the client can reconnect.
 - The server binds to `127.0.0.1` by default, so a development server is not exposed to the network.
 
 ## Verified behaviour
@@ -184,6 +186,18 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 | Same operation id with different content | Rejected; the original stays |
 | Invalid vector (not an array, malformed entry, duplicate site, 501 entries) | Rejected; the connection stays usable |
 | Client that knows more than 500 sites | Sends an empty vector (full replay, still correct) |
+| Client edits while disconnected, then rejoins | Only operations above the server counter for its site are resent |
+| Rejoin when the server already has everything | Nothing is resent |
+| Rejoin when the server lost its state | Everything in the outbox is resent |
+| Reconnect delays (test parameters 100 ms base, 1000 ms cap) | 100, 200, 400, 800, 1000, 1000; waits between half and all of the ceiling; restarts after a successful join |
+| Server still holds the old connection (siteId in use) | Retried with backoff, not reported as an error |
+| Go offline, then online | Stops and resumes reconnecting; late events from a replaced socket are ignored |
+| Two real clients edit while offline, then reconnect | Identical text containing both edits |
+| Connection cut at the moment of an edit | The edit is not lost |
+| Client offline while another writes | Catches up after reconnecting |
+| 15 randomized scenarios (up to 25 edits, offline toggles and cut connections, 3 clients, real server) | All online, identical text and version vectors, nothing pending, no errors |
+| Heartbeat: client that ignores pings | Terminated, its `siteId` can be reused |
+| Heartbeat: client that answers pings | Stays connected across several intervals |
 
 ## Fuzz testing
 
@@ -203,7 +217,7 @@ The first run of the id tests failed. The property test for antisymmetry reporte
 
 ```
 pnpm install
-pnpm test        # 114 tests across four packages
+pnpm test        # 136 tests across four packages
 pnpm typecheck
 ```
 
@@ -213,9 +227,10 @@ CI runs the install, typecheck and test commands on every push.
 
 ## Known limitations
 
-- **No reconnect and no offline editing yet.** A client that disconnects cannot reuse its `siteId` until the server notices the old socket closed. A join sends only the operations the client is missing, but a client that knows more than 500 sites falls back to a full replay.
+- **Offline edits survive a dropped connection but not a page reload.** The document and the outbox live in memory only (IndexedDB is next). A reconnecting client can briefly be refused because the server still holds its old connection; it retries with backoff, and the heartbeat frees the id (detection takes up to two heartbeat intervals, about 60 seconds by default). A join sends only the operations the client is missing, but a client that knows more than 500 sites falls back to a full replay.
 - **The editor binding is a stopgap.** The client works out edits by diffing the textarea value, so typing inside a run of identical characters can attach the new character at the edge of the run instead of where the caret was. The text itself stays correct. Setting the value for a remote edit resets the browser undo history, and carets are shifted by text position rather than anchored to character ids.
-- **A page reload creates a new `siteId`**, and there is no reconnect: after a disconnect the page has to be reloaded.
+- **A page reload creates a new `siteId` and loses unsynced edits**, because the document is in memory.
+- **The outbox is only trimmed on rejoin**, so while connected it holds every operation made this session, and if the server loses its state, operations already trimmed cannot be resent.
 - **The server keeps everything in memory.** A restart loses all documents, and the number of documents is unbounded.
 - **The server is a relay and does not check causality.** An operation whose origin or target never arrives is stored and forwarded, and clients will hold it in their pending buffer forever. The pending buffer itself is unbounded.
 - **Counters are only checked to be safe integers.** A malicious client could send a huge counter and push every replica's clock to the limit.
@@ -237,6 +252,8 @@ CI runs the install, typecheck and test commands on every push.
 - **Deletes get their own operation id**, so every operation is identifiable, which version vectors rely on.
 - **The server enforces per-site increasing order.** That rule is what lets a single counter per site stand for "everything up to here", and it is checked on the server rather than assumed.
 - **One code path for local and remote operations.** Local edits go through the same `integrate` method as remote ones, so the fuzz tests exercise what users actually run.
+- **Nothing is sent until the server answers the join.** The answer carries the server vector, which says how much of this replica own history the server has, so only the rest is resent. This works because the server enforces per-site order.
+- **Reconnecting is a small state machine tested with a fake socket and fake timers**, so backoff and ordering are checked without waiting for real time.
 - **Fuzz harness kept outside the test file** so later phases (partitions, offline) can reuse it.
 - **Strict TypeScript** with `noUncheckedIndexedAccess`, because index-heavy data structure code is full of "this element might not exist" bugs.
 - **Dependency install scripts are denied by default.** pnpm blocks them until approved. The one that asked (`esbuild`, pulled in by `tsx`) is explicitly denied in `pnpm-workspace.yaml`, and the dev server and tests run fine without it.
@@ -269,7 +286,8 @@ apps/
     index.html         the page
     src/
       diff.ts          text diffing in code points, caret shifting
-      session.ts       editor session: text changes to operations, server messages to text
+      session.ts       editor session: text changes to operations, outbox, server messages to text
+      connection.ts    WebSocket lifecycle: reconnect with backoff and jitter, rejoin
       main.ts          DOM and WebSocket wiring
 bench/                 (planned) benchmarks
 docs/                  (planned) design notes
