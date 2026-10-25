@@ -11,7 +11,7 @@ Every claim below is backed by a test in this repository.
 - **A naive design provably fails.** An index-based implementation diverges on a two-user concurrent edit, silently, with no error (see "The problem").
 - **Convergence under random concurrency.** Property-based fuzzing simulates 3 and 10 replicas making random inserts and deletes, with out-of-order and duplicated delivery. Every replica ends with identical text, an empty pending buffer, and exactly one node per insert (nothing lost, nothing duplicated).
 - **Convergence through a real WebSocket server.** Two replicas type concurrently over real connections, end with identical text, and a third client that joins later rebuilds the same document from the server's history.
-- **Reconnect and offline editing against a real server.** Edits keep working while disconnected, and on rejoin only the operations the server is missing are resent. A randomized test runs three clients through random edits, offline periods and cut connections, and requires identical text and version vectors at the end.
+- **Offline edits survive a page reload.** The document and the replica identity are saved on the device, operations are saved before they are sent, and a reloaded page rebuilds the document, keeps its identity, and syncs what it wrote while offline. A reloaded client can also rebuild a server that lost its state. - **Reconnect and offline editing against a real server.** Edits keep working while disconnected, and on rejoin only the operations the server is missing are resent. A randomized test runs three clients through random edits, offline periods and cut connections, and requires identical text and version vectors at the end.
 - **Delta sync with version vectors.** A client that rejoins sends what it already has and receives exactly the missing operations. A property test checks that any prefix of a random three-site history, plus the operations the server says are missing, reproduces the full document and an identical vector.
 - **Out-of-order delivery is handled.** Operations that arrive before their dependency are parked and applied automatically when it shows up. An 11-character chain delivered in reverse order still produces the right text.
 - **Idempotent operations.** Delivering the same operation repeatedly changes nothing, both in the CRDT and on the server.
@@ -19,16 +19,16 @@ Every claim below is backed by a test in this repository.
 - **An editor session with no DOM.** Text changes are turned into operations by diffing in code points (an emoji counts as one character), and the session is tested against an in-memory stand-in for the server. The page is a thin layer on top.
 - **A pure, dependency-free core.** The CRDT has no networking or I/O, so it can be tested exhaustively and shared between client and server.
 
-## Status: CRDT core, protocol, relay server and browser client implemented
+## Status: CRDT core, protocol, relay server and offline-capable browser client implemented
 
-136 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
+166 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
 
 | Package | Tests | Covers |
 | --- | --- | --- |
 | `packages/crdt` | 36 | ids, clock, RGA, causal buffering, version vectors, multi-replica fuzzing |
 | `packages/protocol` | 30 | message validation, version vector validation, limits, round trip with a real replica |
 | `apps/server` | 26 | rooms, delta joins, forwarding, ordering and integrity checks, heartbeat, hostile input, end to end |
-| `apps/client` | 44 | text diffing, caret shifting, editor session and outbox, reconnect with backoff (fake socket and timers), real-server integration and randomized tests |
+| `apps/client` | 74 | text diffing, caret shifting, editor session and outbox, reconnect with backoff (fake socket and timers), local storage (memory and IndexedDB), write-ahead saving, reload scenarios against a real server, randomized tests |
 
 ## Roadmap
 
@@ -43,7 +43,7 @@ Every claim below is backed by a test in this repository.
 - [x] Browser client (textarea bound to a local replica)
 - [x] Version-vector delta sync
 - [x] Reconnect with backoff, in-memory outbox, server heartbeat
-- [ ] Offline queue (IndexedDB)
+- [x] Offline persistence (IndexedDB): document and identity survive reloads
 - [ ] Live cursors anchored to character ids
 - [ ] Persistence (PostgreSQL) and multi-instance fan-out (Redis)
 - [ ] Benchmarks against Yjs, tombstone compaction
@@ -51,9 +51,9 @@ Every claim below is backed by a test in this repository.
 
 ## Tech Stack
 
-**Used so far:** TypeScript, Node.js, `ws`, Vite, Vitest, fast-check (property-based testing), tsx, pnpm workspaces, GitHub Actions
+**Used so far:** TypeScript, Node.js, `ws`, Vite, Vitest, fast-check (property-based testing), tsx, IndexedDB (fake-indexeddb in tests), pnpm workspaces, GitHub Actions
 
-**Planned:** CodeMirror 6, IndexedDB, PostgreSQL, Redis, Docker Compose
+**Planned:** CodeMirror 6, PostgreSQL, Redis, Docker Compose
 
 ## The problem
 
@@ -136,6 +136,16 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 - A heartbeat pings every connection (30 seconds by default) and terminates one that does not answer, which frees its `siteId` so the client can reconnect.
 - The server binds to `127.0.0.1` by default, so a development server is not exposed to the network.
 
+## Offline storage
+
+The browser saves each document on the device (IndexedDB): the replica identity (`siteId`) and every operation sent or received.
+
+- **Write ahead.** An operation this replica creates is saved before it is sent. Saves run one at a time, in order, and the session only sends the saved prefix of its outbox. This is what makes it safe to reuse a `siteId` after a reload: a counter can never be used twice with different content.
+- **Restore.** A reloaded page rebuilds the document from the saved operations. Applying them moves the clock past every counter seen, and the page own operations go back into the outbox, to be trimmed against the server vector on the next join.
+- **A failed save of its own edit is fatal.** Nothing more is sent and editing is disabled. A failed save of a received change is only reported, because the server can send it again.
+- **Saved data is untrusted.** Records are validated with the same parser as network messages; invalid ones are skipped and counted, and an invalid saved identity is refused.
+- **One tab owns a document.** A Web Lock decides which tab uses the saved identity. Another tab on the same document, or a browser without IndexedDB, runs with a temporary identity and an in-memory store and shows a notice.
+
 ## Verified behaviour
 
 | Scenario | Result |
@@ -198,6 +208,22 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 | 15 randomized scenarios (up to 25 edits, offline toggles and cut connections, 3 clients, real server) | All online, identical text and version vectors, nothing pending, no errors |
 | Heartbeat: client that ignores pings | Terminated, its `siteId` can be reused |
 | Heartbeat: client that answers pings | Stays connected across several intervals |
+| Store (run against both an in-memory store and IndexedDB): unknown document, identity of a created document, appended operations, a 2000 operation batch, two documents kept apart | All return what was saved |
+| Store: identity created twice, same operations saved twice | The first identity is kept; no duplicates |
+| Store: a second connection to the same IndexedDB database | Sees the saved identity and operations |
+| Stored operations that fail validation | Skipped and counted |
+| Stored identity that is empty or not a string | Refused |
+| Opening a document twice | Identity created once and returned the second time |
+| Session: operation whose save has not finished | Not sent; sent once saved |
+| Session: two edits in a row | Saved one at a time, sent in order |
+| Session: rejoin while an operation is still being saved | Not resent until it is saved |
+| Session: save of its own edit fails | Nothing sent, reported as fatal, further edits refused, text unchanged |
+| Session: received operations | Saved in order; a failed save is reported and editing continues |
+| Session: restoring saved operations | Text rebuilt, only own operations go to the outbox, the next counter is above every counter seen |
+| Session: rejoin after a restore with server vector at 1 for this site | Resends exactly the operations above 1 |
+| Real server: a client types offline, then reloads | Same identity, same text, all its operations in the outbox; syncs to another client and keeps editing |
+| Real server: the server restarts with no state and the client reloads | The new server is rebuilt (3 of 3 operations) and a late joiner sees the text |
+| Real server: everything a client sent or received | Already saved (4 operations, same identity, nothing skipped) |
 
 ## Fuzz testing
 
@@ -213,11 +239,11 @@ fast-check generates and shrinks the histories, so a failure is reported as a mi
 
 The first run of the id tests failed. The property test for antisymmetry reported the counterexample `{18, "a"}` versus `{18, "a"}`: two identical ids. The comparator was right (it returns 0 both ways); the test was wrong. It compared `Math.sign(0)` with `-Math.sign(0)`, and JavaScript distinguishes `+0` from `-0` under `Object.is`. The fix compares with `===`. The failure is kept as a reminder to ask "code or test?" first when a property test fails.
 
-## Running the tests
+A second failure came from running the same store tests against both an in-memory store and IndexedDB (through `fake-indexeddb`). Creating a document identity twice failed only in the IndexedDB version: adding an existing key raises a request error, and the helper that waits for a transaction also treated errors bubbling up from requests as failure. Suppressing the request error did not help, because the event still reached the transaction. The fix checks and adds inside one read-write transaction and waits only for the transaction to complete or abort. `fake-indexeddb` follows the specified event model, so a real browser is expected to behave the same way, but this was not checked in a real browser. The in-memory store alone would never have shown the problem.  ## Running the tests
 
 ```
 pnpm install
-pnpm test        # 136 tests across four packages
+pnpm test        # 166 tests across four packages
 pnpm typecheck
 ```
 
@@ -227,10 +253,12 @@ CI runs the install, typecheck and test commands on every push.
 
 ## Known limitations
 
-- **Offline edits survive a dropped connection but not a page reload.** The document and the outbox live in memory only (IndexedDB is next). A reconnecting client can briefly be refused because the server still holds its old connection; it retries with backoff, and the heartbeat frees the id (detection takes up to two heartbeat intervals, about 60 seconds by default). A join sends only the operations the client is missing, but a client that knows more than 500 sites falls back to a full replay.
+- **The Web Lock tab check and the page wiring have no automated browser test.** IndexedDB is tested through `fake-indexeddb`, not a real browser. A browser without Web Locks could run two tabs with the same identity.
+- **A failed save of the page own edit disables editing**, and edits made since then exist only in memory until the page is reloaded.
+- **Local storage grows without bound** (no compaction), and durability follows the browser default. A reconnecting client can briefly be refused because the server still holds its old connection; it retries with backoff, and the heartbeat frees the id (detection takes up to two heartbeat intervals, about 60 seconds by default). A join sends only the operations the client is missing, but a client that knows more than 500 sites falls back to a full replay.
 - **The editor binding is a stopgap.** The client works out edits by diffing the textarea value, so typing inside a run of identical characters can attach the new character at the edge of the run instead of where the caret was. The text itself stays correct. Setting the value for a remote edit resets the browser undo history, and carets are shifted by text position rather than anchored to character ids.
-- **A page reload creates a new `siteId` and loses unsynced edits**, because the document is in memory.
-- **The outbox is only trimmed on rejoin**, so while connected it holds every operation made this session, and if the server loses its state, operations already trimmed cannot be resent.
+- **A tab that does not own the saved document** (a second tab on the same document, or a browser without IndexedDB) uses a temporary identity and keeps nothing across reloads.
+- **The outbox is only trimmed on rejoin**, so while connected it holds every operation made this session. If the server loses its state while a page stays open, only the operations still in the outbox are resent; a page reload restores all of its own operations from storage and can rebuild the server. Operations from other sites are not resent by a client.
 - **The server keeps everything in memory.** A restart loses all documents, and the number of documents is unbounded.
 - **The server is a relay and does not check causality.** An operation whose origin or target never arrives is stored and forwarded, and clients will hold it in their pending buffer forever. The pending buffer itself is unbounded.
 - **Counters are only checked to be safe integers.** A malicious client could send a huge counter and push every replica's clock to the limit.
@@ -252,6 +280,9 @@ CI runs the install, typecheck and test commands on every push.
 - **Deletes get their own operation id**, so every operation is identifiable, which version vectors rely on.
 - **The server enforces per-site increasing order.** That rule is what lets a single counter per site stand for "everything up to here", and it is checked on the server rather than assumed.
 - **One code path for local and remote operations.** Local edits go through the same `integrate` method as remote ones, so the fuzz tests exercise what users actually run.
+- **Save before send.** Reusing a `siteId` after a reload is only safe if a counter is never used twice, so operations are saved before they are sent and a failed save stops sending instead of risking a duplicate counter.
+- **Stored data is validated like network input.** It can be old, damaged or edited by hand, so it goes through the same parser as messages from the server. 
+- **Run the same store tests against every implementation.** The in-memory store and IndexedDB share one test suite, which is how the transaction bug above was found. 
 - **Nothing is sent until the server answers the join.** The answer carries the server vector, which says how much of this replica own history the server has, so only the rest is resent. This works because the server enforces per-site order.
 - **Reconnecting is a small state machine tested with a fake socket and fake timers**, so backoff and ordering are checked without waiting for real time.
 - **Fuzz harness kept outside the test file** so later phases (partitions, offline) can reuse it.
@@ -288,6 +319,8 @@ apps/
       diff.ts          text diffing in code points, caret shifting
       session.ts       editor session: text changes to operations, outbox, server messages to text
       connection.ts    WebSocket lifecycle: reconnect with backoff and jitter, rejoin
+      store.ts         local storage: in-memory and IndexedDB, validated loading
+      doc-lock.ts      Web Lock deciding which tab owns the saved document
       main.ts          DOM and WebSocket wiring
 bench/                 (planned) benchmarks
 docs/                  (planned) design notes
