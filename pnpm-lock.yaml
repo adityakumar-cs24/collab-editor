@@ -178,6 +178,19 @@ importers:
         specifier: ^5.0.5
         version: 5.0.5(vite@8.3.5)
 
+  packages/protocol:
+    dependencies:
+      '@collab/crdt':
+        specifier: workspace:*
+        version: link:../crdt
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.5
+        version: 5.0.5(vite@8.3.5)
+
 packages:
 
   '@jridgewell/resolve-uri@3.1.2':
