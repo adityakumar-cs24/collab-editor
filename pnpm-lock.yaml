@@ -166,6 +166,25 @@ importers:
 
   .: {}
 
+  apps/client:
+    dependencies:
+      '@collab/crdt':
+        specifier: workspace:*
+        version: link:../../packages/crdt
+      '@collab/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vite:
+        specifier: ^8.3.5
+        version: 8.3.5(@types/node@26.6.5)(esbuild@0.28.2)(tsx@4.23.15)
+      vitest:
+        specifier: ^5.0.5
+        version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5)(esbuild@0.28.2)(tsx@4.23.15))
+
   apps/server:
     dependencies:
       '@collab/crdt':
