@@ -14,16 +14,27 @@ export interface SessionOptions {
   readonly siteId: string;
   readonly send: (msg: ClientMessage) => void;
   readonly onError?: (message: string) => void;
+  // Saves operations locally. Operations this replica creates are saved BEFORE they are sent,
+  // so a reload can never lead to a counter being used twice.
+  readonly persist?: (ops: Op[]) => Promise<void>;
+  readonly onStorageError?: (message: string, fatal: boolean) => void;
+}
+
+interface OutboxEntry {
+  readonly op: Op;
+  persisted: boolean;
 }
 
 export class EditorSession {
   private readonly rga: Rga;
   private readonly options: SessionOptions;
   // Operations this replica created that the server may not have yet, in counter order.
-  // Trimmed on every rejoin using the server's version vector.
-  private outbox: Op[] = [];
-  private loaded = false; // the document has been received at least once
+  private outbox: OutboxEntry[] = [];
+  private nextToSend = 0; // outbox[0 .. nextToSend) were sent on the current connection
+  private loaded = false; // the document is available (received once, or restored from storage)
   private connected = false; // joined on a live connection
+  private storageFailed = false;
+  private persistChain: Promise<void> = Promise.resolve();
 
   constructor(options: SessionOptions) {
     this.options = options;
@@ -34,7 +45,7 @@ export class EditorSession {
     return this.rga.toString();
   }
 
-  // The document has been loaded at least once, so local edits are allowed (even while offline).
+  // The document is available, so local edits are allowed (even while offline).
   get isJoined(): boolean {
     return this.loaded;
   }
@@ -56,6 +67,24 @@ export class EditorSession {
     return this.rga.versionVector();
   }
 
+  // Resolves when everything handed to storage so far has been saved (or has failed).
+  flushStorage(): Promise<void> {
+    return this.persistChain;
+  }
+
+  // Rebuild the document from operations saved earlier. Applying them moves the clock past every
+  // counter seen, so new operations never reuse one. Own operations go back into the outbox and
+  // are trimmed on the next join using the server vector.
+  restore(ops: readonly Op[]): void {
+    for (const op of ops) this.rga.apply(op);
+    this.outbox = ops
+      .filter((op) => op.id.siteId === this.options.siteId)
+      .sort((a, b) => a.id.counter - b.id.counter)
+      .map((op) => ({ op, persisted: true }));
+    this.nextToSend = 0;
+    this.loaded = true;
+  }
+
   join(): void {
     this.connected = false; // nothing is sent until the server answers
     // Tell the server what we already have so it sends only the rest. If the vector would not fit
@@ -70,9 +99,10 @@ export class EditorSession {
   }
 
   // The user changed the text: turn the difference into operations. They are applied locally and
-  // kept in the outbox; they are sent now if connected, or after the next successful join.
+  // kept in the outbox; they are sent once saved and connected.
   applyLocalText(newText: string): void {
-    if (!this.loaded) throw new Error("cannot edit before joining the document");
+    if (!this.loaded) throw new Error("cannot edit before the document is loaded");
+    if (this.storageFailed) throw new Error("local storage failed: cannot accept more edits");
     const edit = diffCodePoints(this.rga.toString(), newText);
     if (edit === null) return;
 
@@ -81,10 +111,10 @@ export class EditorSession {
     for (let i = 0; i < edit.deleteCount; i++) ops.push(this.rga.deleteAt(edit.index));
     edit.insert.forEach((char, i) => ops.push(this.rga.insertAt(edit.index + i, char)));
 
-    for (const op of ops) {
-      this.outbox.push(op);
-      if (this.connected) this.options.send({ type: "op", op });
-    }
+    const entries: OutboxEntry[] = ops.map((op) => ({ op, persisted: this.options.persist === undefined }));
+    for (const entry of entries) this.outbox.push(entry);
+    if (this.options.persist === undefined) this.flush();
+    else this.enqueuePersist(ops, entries);
   }
 
   // Apply a message from the server. Returns how the visible text changed (null if it did not).
@@ -97,19 +127,58 @@ export class EditorSession {
     if (msg.type === "joined") {
       for (const op of msg.ops) this.rga.apply(op);
       this.loaded = true;
+      this.enqueuePersist(msg.ops, null);
       this.resend(msg.vector ?? []);
     } else {
       this.rga.apply(msg.op);
+      this.enqueuePersist([msg.op], null);
     }
     return diffCodePoints(before, this.rga.toString());
   }
 
-  // The server's copy of our operations is a prefix of ours (each site's operations arrive in order),
-  // so everything above the server's counter for our site is missing and must be sent again.
+  // The server copy of our operations is a prefix of ours (each site operations arrive in order),
+  // so everything above the server counter for our site is missing and must be sent again.
   private resend(serverVector: VectorEntries): void {
     const known = entriesToVector(serverVector).get(this.options.siteId) ?? 0;
-    this.outbox = this.outbox.filter((op) => op.id.counter > known);
+    this.outbox = this.outbox.filter((entry) => entry.op.id.counter > known);
+    this.nextToSend = 0;
     this.connected = true;
-    for (const op of this.outbox) this.options.send({ type: "op", op });
+    this.flush();
+  }
+
+  // Send the saved, not yet sent prefix of the outbox, in order. Stops at the first unsaved entry.
+  private flush(): void {
+    if (!this.connected) return;
+    while (this.nextToSend < this.outbox.length) {
+      const entry = this.outbox[this.nextToSend];
+      if (entry === undefined || !entry.persisted) break;
+      this.options.send({ type: "op", op: entry.op });
+      this.nextToSend++;
+    }
+  }
+
+  // Saves are done one after another, in order. For our own operations a failure is fatal: sending
+  // an operation that was not saved could lead to its counter being reused after a reload.
+  private enqueuePersist(ops: readonly Op[], own: OutboxEntry[] | null): void {
+    const persist = this.options.persist;
+    if (persist === undefined || ops.length === 0) return;
+    this.persistChain = this.persistChain.then(async () => {
+      try {
+        await persist([...ops]);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (own !== null) {
+          this.storageFailed = true;
+          this.options.onStorageError?.(`could not save edits locally: ${reason}`, true);
+        } else {
+          this.options.onStorageError?.(`could not save received changes locally: ${reason}`, false);
+        }
+        return;
+      }
+      if (own !== null) {
+        for (const entry of own) entry.persisted = true;
+        this.flush();
+      }
+    });
   }
 }

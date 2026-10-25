@@ -123,7 +123,7 @@ describe("EditorSession", () => {
 
   it("refuses local edits before joining", () => {
     const session = new EditorSession({ docId: "doc", siteId: "bob", send: () => {} });
-    expect(() => session.applyLocalText("x")).toThrow("before joining");
+    expect(() => session.applyLocalText("x")).toThrow("before the document is loaded");
   });
 
   it("forwards server errors to onError", () => {
