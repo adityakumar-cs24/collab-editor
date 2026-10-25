@@ -14,17 +14,19 @@ Every claim below is backed by a test in this repository.
 - **Out-of-order delivery is handled.** Operations that arrive before their dependency are parked and applied automatically when it shows up. An 11-character chain delivered in reverse order still produces the right text.
 - **Idempotent operations.** Delivering the same operation repeatedly changes nothing, both in the CRDT and on the server.
 - **The wire is treated as hostile.** A shared protocol package validates every message on both sides. Malformed JSON, bad ids, oversized messages, binary frames, forged site ids and operations sent before joining are all rejected, and the server stays usable afterwards.
+- **An editor session with no DOM.** Text changes are turned into operations by diffing in code points (an emoji counts as one character), and the session is tested against an in-memory stand-in for the server. The page is a thin layer on top.
 - **A pure, dependency-free core.** The CRDT has no networking or I/O, so it can be tested exhaustively and shared between client and server.
 
-## Status: CRDT core, protocol and relay server complete; browser client in progress
+## Status: CRDT core, protocol, relay server and browser client implemented
 
-65 tests across three packages, run in CI on every push.
+86 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
 
 | Package | Tests | Covers |
 | --- | --- | --- |
 | `packages/crdt` | 28 | ids, clock, RGA, causal buffering, multi-replica fuzzing |
 | `packages/protocol` | 22 | message validation, limits, round trip with a real replica |
 | `apps/server` | 15 | rooms, history, forwarding, hostile input, end to end |
+| `apps/client` | 21 | text diffing, caret shifting, editor session against an in-memory server stand-in |
 
 ## Roadmap
 
@@ -36,7 +38,7 @@ Every claim below is backed by a test in this repository.
 - [x] Multi-replica fuzz harness
 - [x] Shared protocol with validated parsing
 - [x] WebSocket server: rooms, history, validated broadcast
-- [ ] Browser client (textarea bound to a local replica)
+- [x] Browser client (textarea bound to a local replica)
 - [ ] Version-vector sync and reconnect
 - [ ] Offline queue (IndexedDB)
 - [ ] Live cursors anchored to character ids
@@ -46,9 +48,9 @@ Every claim below is backed by a test in this repository.
 
 ## Tech Stack
 
-**Used so far:** TypeScript, Node.js, `ws`, Vitest, fast-check (property-based testing), tsx, pnpm workspaces, GitHub Actions
+**Used so far:** TypeScript, Node.js, `ws`, Vite, Vitest, fast-check (property-based testing), tsx, pnpm workspaces, GitHub Actions
 
-**Planned:** Vite and CodeMirror 6, IndexedDB, PostgreSQL, Redis, Docker Compose
+**Planned:** CodeMirror 6, IndexedDB, PostgreSQL, Redis, Docker Compose
 
 ## The problem
 
@@ -159,6 +161,15 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 | Protocol: an extra field on an operation | Dropped from the parsed result |
 | Protocol: a joined message containing one invalid operation | The whole message is rejected |
 | Operations encoded, parsed and applied to a second replica | Same text |
+| Client: typing in one session | Appears in the other |
+| Client: replacing a selection | Synced as deletes plus inserts |
+| Client: two sessions typing concurrently | Identical text |
+| Client: a session joining late | Rebuilds the document from history |
+| Client: an emoji inserted and deleted | Counts as one character, synced both ways |
+| Client: diff of append, insert, delete, replacement | One exact edit (index, delete count, inserted characters) |
+| Client: caret after a remote edit | Before the edit stays, after it shifts, inside a removed range lands after the insertion |
+| Client: local edit before joining | Refused |
+| Client: server error message | Passed to the error handler |
 
 ## Fuzz testing
 
@@ -178,7 +189,7 @@ The first run of the id tests failed. The property test for antisymmetry reporte
 
 ```
 pnpm install
-pnpm test        # 65 tests across three packages
+pnpm test        # 86 tests across four packages
 pnpm typecheck
 ```
 
@@ -188,7 +199,9 @@ CI runs the install, typecheck and test commands on every push.
 
 ## Known limitations
 
-- **No browser client verified yet, no reconnect, no offline editing.** A client that disconnects cannot reuse its `siteId` until the server notices the old socket closed. Every join sends the whole history; version vectors are the planned replacement.
+- **No reconnect and no offline editing yet.** A client that disconnects cannot reuse its `siteId` until the server notices the old socket closed. Every join sends the whole history; version vectors are the planned replacement.
+- **The editor binding is a stopgap.** The client works out edits by diffing the textarea value, so typing inside a run of identical characters can attach the new character at the edge of the run instead of where the caret was. The text itself stays correct. Setting the value for a remote edit resets the browser undo history, and carets are shifted by text position rather than anchored to character ids.
+- **A page reload creates a new `siteId`**, and there is no reconnect: after a disconnect the page has to be reloaded.
 - **The server keeps everything in memory.** A restart loses all documents, and the number of documents is unbounded.
 - **The server is a relay and does not check causality.** An operation whose origin or target never arrives is stored and forwarded, and clients will hold it in their pending buffer forever. The pending buffer itself is unbounded.
 - **Counters are only checked to be safe integers.** A malicious client could send a huge counter and push every replica's clock to the limit.
@@ -235,7 +248,12 @@ apps/
       server.ts        WebSocket server: rooms, history, broadcast
       main.ts          entry point (PORT and HOST environment variables)
       test-helpers.ts  test client
-  client/              (in progress) browser editor
+  client/
+    index.html         the page
+    src/
+      diff.ts          text diffing in code points, caret shifting
+      session.ts       editor session: text changes to operations, server messages to text
+      main.ts          DOM and WebSocket wiring
 bench/                 (planned) benchmarks
 docs/                  (planned) design notes
 ```
@@ -245,6 +263,7 @@ docs/                  (planned) design notes
 ```
 pnpm install
 pnpm --filter @collab/server dev     # ws://127.0.0.1:8080
+pnpm --filter @collab/client dev     # http://localhost:5173/?doc=demo (second terminal)
 ```
 
 Set `PORT` and `HOST` to change where it listens. It binds to localhost unless you say otherwise.
