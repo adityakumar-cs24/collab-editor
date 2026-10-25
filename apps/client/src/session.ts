@@ -1,5 +1,10 @@
 import { Rga } from "@collab/crdt";
-import type { ClientMessage, ServerMessage } from "@collab/protocol";
+import {
+  MAX_CLIENT_VECTOR_ENTRIES,
+  vectorToEntries,
+  type ClientMessage,
+  type ServerMessage,
+} from "@collab/protocol";
 import { diffCodePoints, type TextEdit } from "./diff";
 
 export interface SessionOptions {
@@ -28,7 +33,11 @@ export class EditorSession {
   }
 
   join(): void {
-    this.options.send({ type: "join", docId: this.options.docId, siteId: this.options.siteId });
+    // Tell the server what we already have so it sends only the rest. If the vector would not fit
+    // in one message, send an empty one: correct, but the server replays the whole history.
+    const entries = vectorToEntries(this.rga.versionVector());
+    const vector = entries.length <= MAX_CLIENT_VECTOR_ENTRIES ? entries : [];
+    this.options.send({ type: "join", docId: this.options.docId, siteId: this.options.siteId, vector });
   }
 
   // The user changed the text: turn the difference into operations and send them.

@@ -1,9 +1,11 @@
 import { WebSocketServer, WebSocket, type RawData } from "ws";
-import { idKey, type Op } from "@collab/crdt";
+import { idKey, missingOps, type Op } from "@collab/crdt";
 import {
   MAX_MESSAGE_LENGTH,
   encode,
+  entriesToVector,
   parseClientMessage,
+  vectorToEntries,
   type ClientMessage,
   type ServerMessage,
 } from "@collab/protocol";
@@ -22,7 +24,8 @@ export interface RunningServer {
 
 interface Room {
   readonly log: Op[]; // every operation, in arrival order
-  readonly seen: Set<string>; // operation ids already in the log
+  readonly seen: Map<string, Op>; // operations already in the log, by id
+  readonly vector: Map<string, number>; // highest counter per site in the log
   readonly clients: Map<string, WebSocket>; // siteId -> connection
 }
 
@@ -68,7 +71,7 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
 
     let room = rooms.get(msg.docId);
     if (room === undefined) {
-      room = { log: [], seen: new Set(), clients: new Map() };
+      room = { log: [], seen: new Map(), vector: new Map(), clients: new Map() };
       rooms.set(msg.docId, room);
     }
     if (room.clients.has(msg.siteId)) {
@@ -77,7 +80,14 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
 
     room.clients.set(msg.siteId, ws);
     sessions.set(ws, { docId: msg.docId, siteId: msg.siteId });
-    sendMessage(ws, { type: "joined", docId: msg.docId, ops: room.log });
+    // Send only what the client does not have yet.
+    const known = entriesToVector(msg.vector ?? []);
+    sendMessage(ws, {
+      type: "joined",
+      docId: msg.docId,
+      ops: missingOps(room.log, known),
+      vector: vectorToEntries(room.vector),
+    });
   }
 
   function handleOp(ws: WebSocket, op: Op): void {
@@ -90,10 +100,22 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     if (room === undefined) return sendError(ws, "document not found");
 
     const key = idKey(op.id);
-    if (room.seen.has(key)) return; // duplicate: already stored and broadcast
+    const existing = room.seen.get(key);
+    if (existing !== undefined) {
+      // A retry is harmless. The same id with different content would make replicas diverge.
+      if (JSON.stringify(existing) !== JSON.stringify(op)) {
+        return sendError(ws, "conflicting operation id");
+      }
+      return; // duplicate: already stored and broadcast
+    }
+    // Each site's operations must arrive in increasing counter order: version vectors rely on it.
+    if (op.id.counter <= (room.vector.get(op.id.siteId) ?? 0)) {
+      return sendError(ws, "operation out of order for this site");
+    }
     if (room.log.length >= maxOps) return sendError(ws, "document is full");
 
-    room.seen.add(key);
+    room.seen.set(key, op);
+    room.vector.set(op.id.siteId, op.id.counter);
     room.log.push(op);
 
     const payload = encode({ type: "op", op });

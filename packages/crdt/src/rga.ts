@@ -31,6 +31,8 @@ export class Rga {
   private readonly byId = new Map<string, Node>();
   // Operations received before their dependency, keyed by operation id.
   private readonly pending = new Map<string, Op>();
+  // Highest counter received from each site (applied or waiting in the pending buffer).
+  private readonly vector = new Map<string, number>();
 
   constructor(siteId: SiteId) {
     this.siteId = siteId;
@@ -61,6 +63,15 @@ export class Rga {
     return this.pending.size;
   }
 
+  // A copy of the version vector: highest counter received from each site.
+  versionVector(): Map<string, number> {
+    return new Map(this.vector);
+  }
+
+  private record(id: CharId): void {
+    if ((this.vector.get(id.siteId) ?? 0) < id.counter) this.vector.set(id.siteId, id.counter);
+  }
+
   // ---------- local edits: return the operation to send to others ----------
 
   insertAt(index: number, char: string): InsertOp {
@@ -75,6 +86,7 @@ export class Rga {
       origin: left ? left.id : null,
       char,
     };
+    this.record(op.id);
     this.integrate(op);
     return op;
   }
@@ -90,6 +102,7 @@ export class Rga {
       id: makeId(this.clock.tick(), this.siteId),
       target: target.id,
     };
+    this.record(op.id);
     this.integrate(op);
     return op;
   }
@@ -100,6 +113,7 @@ export class Rga {
   // and in any order relative to other operations.
   apply(op: Op): void {
     this.clock.observe(op.id.counter);
+    this.record(op.id);
 
     if (op.type === "insert" && this.byId.has(idKey(op.id))) return; // already applied
     if (this.pending.has(idKey(op.id))) return; // already waiting

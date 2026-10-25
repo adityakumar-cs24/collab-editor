@@ -155,7 +155,7 @@ describe("hostile input", () => {
     client.sendRaw("{nope");
     expect(await client.next()).toEqual({ type: "error", message: "invalid JSON" });
     client.send({ type: "join", docId: "doc", siteId: "alice" });
-    expect(await client.next()).toEqual({ type: "joined", docId: "doc", ops: [] });
+    expect(await client.next()).toEqual({ type: "joined", docId: "doc", ops: [], vector: [] });
   });
 
   it("rejects binary messages", async () => {

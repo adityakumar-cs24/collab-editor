@@ -3,9 +3,12 @@ import {
   DOC_ID_PATTERN,
   MAX_MESSAGE_LENGTH,
   MAX_SERVER_MESSAGE_LENGTH,
+  MAX_CLIENT_VECTOR_ENTRIES,
+  MAX_SERVER_VECTOR_ENTRIES,
   MAX_SITE_ID_LENGTH,
   type ClientMessage,
   type ServerMessage,
+  type VectorEntries,
 } from "./messages";
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -30,6 +33,28 @@ function parseId(v: unknown): CharId | null {
   // Lamport counters start at 1 (the first tick), so 0 and below are invalid.
   if (typeof counter !== "number" || !Number.isSafeInteger(counter) || counter < 1) return null;
   return { counter, siteId };
+}
+
+// A missing vector means "I have nothing", which makes the server send everything.
+function parseVector(v: unknown, maxEntries: number): ParseResult<VectorEntries> {
+  if (v === undefined) return ok<VectorEntries>([]);
+  if (!Array.isArray(v)) return fail("vector must be an array");
+  if (v.length > maxEntries) return fail("vector too large");
+  const seen = new Set<string>();
+  const entries: VectorEntries = [];
+  for (const item of v as unknown[]) {
+    if (!Array.isArray(item) || item.length !== 2) return fail("vector entries must be [siteId, counter]");
+    const siteId = parseSiteId(item[0]);
+    const counter: unknown = item[1];
+    if (siteId === null) return fail("vector entry has an invalid siteId");
+    if (typeof counter !== "number" || !Number.isSafeInteger(counter) || counter < 1) {
+      return fail("vector entry has an invalid counter");
+    }
+    if (seen.has(siteId)) return fail("vector has a duplicate siteId");
+    seen.add(siteId);
+    entries.push([siteId, counter]);
+  }
+  return ok<VectorEntries>(entries);
 }
 
 function parseOp(v: unknown): ParseResult<Op> {
@@ -80,7 +105,9 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
       if (typeof docId !== "string" || !DOC_ID_PATTERN.test(docId)) return fail("invalid docId");
       const siteId = parseSiteId(msg["siteId"]);
       if (siteId === null) return fail("invalid siteId");
-      return ok<ClientMessage>({ type: "join", docId, siteId });
+      const vector = parseVector(msg["vector"], MAX_CLIENT_VECTOR_ENTRIES);
+      if (!vector.ok) return vector;
+      return ok<ClientMessage>({ type: "join", docId, siteId, vector: vector.value });
     }
     case "op": {
       const op = parseOp(msg["op"]);
@@ -111,7 +138,9 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
         if (!op.ok) return op;
         ops.push(op.value);
       }
-      return ok<ServerMessage>({ type: "joined", docId, ops });
+      const vector = parseVector(msg["vector"], MAX_SERVER_VECTOR_ENTRIES);
+      if (!vector.ok) return vector;
+      return ok<ServerMessage>({ type: "joined", docId, ops, vector: vector.value });
     }
     case "op": {
       const op = parseOp(msg["op"]);

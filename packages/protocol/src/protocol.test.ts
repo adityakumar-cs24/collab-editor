@@ -12,7 +12,7 @@ describe("parseClientMessage: valid messages", () => {
   it("accepts join", () => {
     expect(parse({ type: "join", docId: "notes-1", siteId: "alice" })).toEqual({
       ok: true,
-      value: { type: "join", docId: "notes-1", siteId: "alice" },
+      value: { type: "join", docId: "notes-1", siteId: "alice", vector: [] },
     });
   });
 
@@ -121,7 +121,7 @@ describe("parseServerMessage", () => {
     const raw = JSON.stringify({ type: "joined", docId: "doc", ops: [insertOp, deleteOp] });
     expect(parseServerMessage(raw)).toEqual({
       ok: true,
-      value: { type: "joined", docId: "doc", ops: [insertOp, deleteOp] },
+      value: { type: "joined", docId: "doc", ops: [insertOp, deleteOp], vector: [] },
     });
   });
 

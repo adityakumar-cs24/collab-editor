@@ -54,11 +54,16 @@ export function simulate(n: number, actions: readonly Action[]): SimulationResul
   return { replicas, insertCount };
 }
 
+function vectorKey(r: Rga): string {
+  return JSON.stringify([...r.versionVector()].sort());
+}
+
 export function expectConverged({ replicas, insertCount }: SimulationResult): void {
   const expected = at(replicas, 0).toString();
   for (const r of replicas) {
     expect(r.toString()).toBe(expected);
     expect(r.pendingCount).toBe(0);
     expect(r.nodeCount).toBe(insertCount);
+    expect(vectorKey(r)).toBe(vectorKey(at(replicas, 0)));
   }
 }
