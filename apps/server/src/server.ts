@@ -14,6 +14,7 @@ export interface ServerOptions {
   port?: number; // 0 picks a free port
   host?: string;
   maxOpsPerDocument?: number;
+  heartbeatIntervalMs?: number; // how often to ping; 0 disables (default 30000)
 }
 
 export interface RunningServer {
@@ -135,7 +136,31 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     // The room and its log stay, so the document survives everyone leaving.
   }
 
+  // Heartbeat: a connection that goes silent (half-open TCP, a laptop lid closed) is terminated,
+  // which frees its siteId so the client can reconnect.
+  const alive = new WeakSet<WebSocket>();
+  const heartbeatMs = options.heartbeatIntervalMs ?? 30_000;
+  const heartbeat =
+    heartbeatMs > 0
+      ? setInterval(() => {
+          for (const client of wss.clients) {
+            if (!alive.has(client)) {
+              client.terminate();
+              continue;
+            }
+            alive.delete(client);
+            client.ping();
+          }
+        }, heartbeatMs)
+      : null;
+  heartbeat?.unref();
+  wss.on("close", () => {
+    if (heartbeat) clearInterval(heartbeat);
+  });
+
   wss.on("connection", (ws) => {
+    alive.add(ws);
+    ws.on("pong", () => alive.add(ws));
     ws.on("message", (data, isBinary) => {
       if (isBinary) return sendError(ws, "binary messages are not supported");
       const parsed = parseClientMessage(rawToString(data));

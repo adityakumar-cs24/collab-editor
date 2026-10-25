@@ -15,8 +15,13 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@collab/server": "workspace:*",
+    "@types/node": "^26.6.5",
+    "@types/ws": "^8.18.2",
+    "fast-check": "^4.10.2",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
-    "vitest": "^5.0.5"
+    "vitest": "^5.0.5",
+    "ws": "^8.22.0"
   }
 }
