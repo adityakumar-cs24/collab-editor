@@ -239,7 +239,9 @@ fast-check generates and shrinks the histories, so a failure is reported as a mi
 
 The first run of the id tests failed. The property test for antisymmetry reported the counterexample `{18, "a"}` versus `{18, "a"}`: two identical ids. The comparator was right (it returns 0 both ways); the test was wrong. It compared `Math.sign(0)` with `-Math.sign(0)`, and JavaScript distinguishes `+0` from `-0` under `Object.is`. The fix compares with `===`. The failure is kept as a reminder to ask "code or test?" first when a property test fails.
 
-A second failure came from running the same store tests against both an in-memory store and IndexedDB (through `fake-indexeddb`). Creating a document identity twice failed only in the IndexedDB version: adding an existing key raises a request error, and the helper that waits for a transaction also treated errors bubbling up from requests as failure. Suppressing the request error did not help, because the event still reached the transaction. The fix checks and adds inside one read-write transaction and waits only for the transaction to complete or abort. `fake-indexeddb` follows the specified event model, so a real browser is expected to behave the same way, but this was not checked in a real browser. The in-memory store alone would never have shown the problem.  ## Running the tests
+A second failure came from running the same store tests against both an in-memory store and IndexedDB (through `fake-indexeddb`). Creating a document identity twice failed only in the IndexedDB version: adding an existing key raises a request error, and the helper that waits for a transaction also treated errors bubbling up from requests as failure. Suppressing the request error did not help, because the event still reached the transaction. The fix checks and adds inside one read-write transaction and waits only for the transaction to complete or abort. `fake-indexeddb` follows the specified event model, so a real browser is expected to behave the same way, but this was not checked in a real browser. The in-memory store alone would never have shown the problem.
+
+## Running the tests
 
 ```
 pnpm install
