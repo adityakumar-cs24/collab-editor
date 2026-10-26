@@ -1,3 +1,4 @@
+import { PgStorage } from "./pg-storage";
 import { startServer } from "./server";
 
 const port = Number(process.env["PORT"] ?? 8080);
@@ -7,9 +8,20 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
   process.exit(1);
 }
 
-const server = await startServer({ port, host });
+const databaseUrl = process.env["DATABASE_URL"];
+const storage = databaseUrl ? await PgStorage.open({ connectionString: databaseUrl }) : undefined;
+console.log(
+  storage
+    ? "documents are stored in PostgreSQL"
+    : "no DATABASE_URL: documents are kept in memory and lost when the server stops",
+);
+
+const server = await startServer({ port, host, storage });
 console.log(`collab server listening on ws://${host}:${server.port}`);
 
 process.on("SIGINT", () => {
-  void server.close().then(() => process.exit(0));
+  void server
+    .close()
+    .then(() => storage?.close())
+    .then(() => process.exit(0));
 });

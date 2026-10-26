@@ -9,12 +9,17 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from "@collab/protocol";
+import { MemoryStorage, indexOps, validateStoredOps, type OpStorage } from "./storage";
 
 export interface ServerOptions {
   port?: number; // 0 picks a free port
   host?: string;
   maxOpsPerDocument?: number;
   heartbeatIntervalMs?: number; // how often to ping; 0 disables (default 30000)
+  // Where operations are kept. The default is memory only. A storage passed in stays open when
+  // the server closes: whoever created it closes it.
+  storage?: OpStorage;
+  onError?: (error: unknown) => void;
 }
 
 export interface RunningServer {
@@ -24,10 +29,15 @@ export interface RunningServer {
 }
 
 interface Room {
-  readonly log: Op[]; // every operation, in arrival order
-  readonly seen: Map<string, Op>; // operations already in the log, by id
-  readonly vector: Map<string, number>; // highest counter per site in the log
+  readonly docId: string;
   readonly clients: Map<string, WebSocket>; // siteId -> connection
+  log: Op[]; // every operation, in arrival order
+  seen: Map<string, Op>; // operations in the log, by id
+  vector: Map<string, number>; // highest counter per site in the log
+  loaded: boolean;
+  // Joins and writes for one document run one at a time, so storage order, memory order and
+  // broadcast order are always the same.
+  queue: Promise<void>;
 }
 
 interface Session {
@@ -56,10 +66,27 @@ function sendError(ws: WebSocket, message: string): void {
   sendMessage(ws, { type: "error", message });
 }
 
+function runInRoom<T>(room: Room, task: () => Promise<T>): Promise<T> {
+  const result = room.queue.then(task);
+  room.queue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 export function startServer(options: ServerOptions = {}): Promise<RunningServer> {
   const maxOps = options.maxOpsPerDocument ?? DEFAULT_MAX_OPS_PER_DOCUMENT;
+  const ownsStorage = options.storage === undefined;
+  const storage = options.storage ?? new MemoryStorage();
+  const onError = options.onError ?? ((error: unknown) => console.error("server error:", error));
   const rooms = new Map<string, Room>();
   const sessions = new Map<WebSocket, Session>();
+  // Connections that had a storage failure. Nothing more is accepted from them: their next
+  // operation would otherwise leave a gap in the counters of that site.
+  const broken = new WeakSet<WebSocket>();
+  // Messages of one connection are handled one at a time, in order.
+  const chains = new WeakMap<WebSocket, Promise<void>>();
 
   const wss = new WebSocketServer({
     port: options.port ?? 0,
@@ -67,31 +94,81 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     maxPayload: MAX_MESSAGE_LENGTH, // bytes; ws closes the connection with 1009 beyond this
   });
 
-  function handleJoin(ws: WebSocket, msg: Extract<ClientMessage, { type: "join" }>): void {
-    if (sessions.has(ws)) return sendError(ws, "already joined");
+  function fail(ws: WebSocket): void {
+    broken.add(ws);
+    ws.close(1011, "internal error"); // the client reconnects and rejoins from the server vector
+  }
 
-    let room = rooms.get(msg.docId);
+  function enqueue(ws: WebSocket, task: () => Promise<void>): void {
+    const previous = chains.get(ws) ?? Promise.resolve();
+    const next = previous.then(task).catch((error: unknown) => {
+      onError(error);
+      fail(ws);
+    });
+    chains.set(ws, next);
+  }
+
+  function getRoom(docId: string): Room {
+    let room = rooms.get(docId);
     if (room === undefined) {
-      room = { log: [], seen: new Map(), vector: new Map(), clients: new Map() };
-      rooms.set(msg.docId, room);
+      room = {
+        docId,
+        clients: new Map(),
+        log: [],
+        seen: new Map(),
+        vector: new Map(),
+        loaded: false,
+        queue: Promise.resolve(),
+      };
+      rooms.set(docId, room);
     }
-    if (room.clients.has(msg.siteId)) {
-      return sendError(ws, "siteId already in use in this document");
-    }
+    return room;
+  }
 
-    room.clients.set(msg.siteId, ws);
-    sessions.set(ws, { docId: msg.docId, siteId: msg.siteId });
-    // Send only what the client does not have yet.
-    const known = entriesToVector(msg.vector ?? []);
-    sendMessage(ws, {
-      type: "joined",
-      docId: msg.docId,
-      ops: missingOps(room.log, known),
-      vector: vectorToEntries(room.vector),
+  async function loadRoom(room: Room): Promise<void> {
+    const raw = await storage.load(room.docId);
+    const ops = validateStoredOps(room.docId, raw);
+    const index = indexOps(room.docId, ops);
+    room.log = ops;
+    room.seen = index.seen;
+    room.vector = index.vector;
+    room.loaded = true;
+  }
+
+  async function handleJoin(ws: WebSocket, msg: Extract<ClientMessage, { type: "join" }>): Promise<void> {
+    if (sessions.has(ws)) return sendError(ws, "already joined");
+    const room = getRoom(msg.docId);
+    await runInRoom(room, async () => {
+      if (broken.has(ws) || ws.readyState !== WebSocket.OPEN) return;
+      if (!room.loaded) {
+        try {
+          await loadRoom(room);
+        } catch (error) {
+          onError(error);
+          sendError(ws, "could not load document");
+          fail(ws);
+          return;
+        }
+      }
+      // The connection may have closed while the document was loading.
+      if (broken.has(ws) || ws.readyState !== WebSocket.OPEN) return;
+      if (room.clients.has(msg.siteId)) {
+        return sendError(ws, "siteId already in use in this document");
+      }
+      room.clients.set(msg.siteId, ws);
+      sessions.set(ws, { docId: msg.docId, siteId: msg.siteId });
+      // Send only what the client does not have yet.
+      const known = entriesToVector(msg.vector ?? []);
+      sendMessage(ws, {
+        type: "joined",
+        docId: msg.docId,
+        ops: missingOps(room.log, known),
+        vector: vectorToEntries(room.vector),
+      });
     });
   }
 
-  function handleOp(ws: WebSocket, op: Op): void {
+  async function handleOp(ws: WebSocket, op: Op): Promise<void> {
     const session = sessions.get(ws);
     if (session === undefined) return sendError(ws, "join a document first");
     if (op.id.siteId !== session.siteId) {
@@ -100,29 +177,43 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     const room = rooms.get(session.docId);
     if (room === undefined) return sendError(ws, "document not found");
 
-    const key = idKey(op.id);
-    const existing = room.seen.get(key);
-    if (existing !== undefined) {
-      // A retry is harmless. The same id with different content would make replicas diverge.
-      if (JSON.stringify(existing) !== JSON.stringify(op)) {
-        return sendError(ws, "conflicting operation id");
+    await runInRoom(room, async () => {
+      if (broken.has(ws) || sessions.get(ws) !== session) return;
+
+      const key = idKey(op.id);
+      const existing = room.seen.get(key);
+      if (existing !== undefined) {
+        // A retry is harmless. The same id with different content would make replicas diverge.
+        if (JSON.stringify(existing) !== JSON.stringify(op)) {
+          return sendError(ws, "conflicting operation id");
+        }
+        return; // duplicate: already stored and broadcast
       }
-      return; // duplicate: already stored and broadcast
-    }
-    // Each site's operations must arrive in increasing counter order: version vectors rely on it.
-    if (op.id.counter <= (room.vector.get(op.id.siteId) ?? 0)) {
-      return sendError(ws, "operation out of order for this site");
-    }
-    if (room.log.length >= maxOps) return sendError(ws, "document is full");
+      // Each site's operations must arrive in increasing counter order: version vectors rely on it.
+      if (op.id.counter <= (room.vector.get(op.id.siteId) ?? 0)) {
+        return sendError(ws, "operation out of order for this site");
+      }
+      if (room.log.length >= maxOps) return sendError(ws, "document is full");
 
-    room.seen.set(key, op);
-    room.vector.set(op.id.siteId, op.id.counter);
-    room.log.push(op);
+      // Save first. Only an operation that is stored is added to memory and forwarded.
+      try {
+        await storage.append(room.docId, op);
+      } catch (error) {
+        onError(error);
+        sendError(ws, "could not save operation");
+        fail(ws);
+        return;
+      }
 
-    const payload = encode({ type: "op", op });
-    for (const client of room.clients.values()) {
-      if (client !== ws) sendRaw(client, payload); // the sender already applied it locally
-    }
+      room.seen.set(key, op);
+      room.vector.set(op.id.siteId, op.id.counter);
+      room.log.push(op);
+
+      const payload = encode({ type: "op", op });
+      for (const client of room.clients.values()) {
+        if (client !== ws) sendRaw(client, payload); // the sender already applied it locally
+      }
+    });
   }
 
   function leave(ws: WebSocket): void {
@@ -162,12 +253,15 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     alive.add(ws);
     ws.on("pong", () => alive.add(ws));
     ws.on("message", (data, isBinary) => {
-      if (isBinary) return sendError(ws, "binary messages are not supported");
-      const parsed = parseClientMessage(rawToString(data));
-      if (!parsed.ok) return sendError(ws, parsed.error);
-      const msg = parsed.value;
-      if (msg.type === "join") handleJoin(ws, msg);
-      else handleOp(ws, msg.op);
+      enqueue(ws, async () => {
+        if (broken.has(ws)) return;
+        if (isBinary) return sendError(ws, "binary messages are not supported");
+        const parsed = parseClientMessage(rawToString(data));
+        if (!parsed.ok) return sendError(ws, parsed.error);
+        const msg = parsed.value;
+        if (msg.type === "join") await handleJoin(ws, msg);
+        else await handleOp(ws, msg.op);
+      });
     });
     ws.on("close", () => leave(ws));
     // Without an error listener, a protocol error (like an oversized frame) would crash the process.
@@ -178,7 +272,7 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
     wss.once("error", reject);
     wss.once("listening", () => {
       wss.off("error", reject);
-      wss.on("error", (err) => console.error("server error:", err));
+      wss.on("error", (err) => onError(err));
       const address = wss.address();
       if (address === null || typeof address === "string") {
         reject(new Error("could not determine server port"));
@@ -191,9 +285,10 @@ export function startServer(options: ServerOptions = {}): Promise<RunningServer>
           for (const room of rooms.values()) operations += room.log.length;
           return { connections: sessions.size, documents: rooms.size, operations };
         },
-        close() {
+        async close() {
           for (const client of wss.clients) client.terminate();
-          return new Promise<void>((done) => wss.close(() => done()));
+          await new Promise<void>((done) => wss.close(() => done()));
+          if (ownsStorage) await storage.close();
         },
       });
     });
