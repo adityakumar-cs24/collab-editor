@@ -11,6 +11,7 @@ Every claim below is backed by a test in this repository.
 - **A naive design provably fails.** An index-based implementation diverges on a two-user concurrent edit, silently, with no error (see "The problem").
 - **Convergence under random concurrency.** Property-based fuzzing simulates 3 and 10 replicas making random inserts and deletes, with out-of-order and duplicated delivery. Every replica ends with identical text, an empty pending buffer, and exactly one node per insert (nothing lost, nothing duplicated).
 - **Convergence through a real WebSocket server.** Two replicas type concurrently over real connections, end with identical text, and a third client that joins later rebuilds the same document from the server's history.
+- **Documents survive a server restart.** Operations are stored in PostgreSQL before they are forwarded, and a restarted server rebuilds a document from storage, validating what it loads and refusing a document whose stored data is damaged instead of serving it with a gap.
 - **Offline edits survive a page reload.** The document and the replica identity are saved on the device, operations are saved before they are sent, and a reloaded page rebuilds the document, keeps its identity, and syncs what it wrote while offline. A reloaded client can also rebuild a server that lost its state. - **Reconnect and offline editing against a real server.** Edits keep working while disconnected, and on rejoin only the operations the server is missing are resent. A randomized test runs three clients through random edits, offline periods and cut connections, and requires identical text and version vectors at the end.
 - **Delta sync with version vectors.** A client that rejoins sends what it already has and receives exactly the missing operations. A property test checks that any prefix of a random three-site history, plus the operations the server says are missing, reproduces the full document and an identical vector.
 - **Out-of-order delivery is handled.** Operations that arrive before their dependency are parked and applied automatically when it shows up. An 11-character chain delivered in reverse order still produces the right text.
@@ -21,13 +22,13 @@ Every claim below is backed by a test in this repository.
 
 ## Status: CRDT core, protocol, relay server and offline-capable browser client implemented
 
-166 tests across four packages, run in CI on every push. The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
+196 tests across four packages (187 run without a database; the other 9 need `TEST_DATABASE_URL`). The client page itself (textarea and WebSocket wiring) is not covered by an automated browser test.
 
 | Package | Tests | Covers |
 | --- | --- | --- |
 | `packages/crdt` | 36 | ids, clock, RGA, causal buffering, version vectors, multi-replica fuzzing |
 | `packages/protocol` | 30 | message validation, version vector validation, limits, round trip with a real replica |
-| `apps/server` | 26 | rooms, delta joins, forwarding, ordering and integrity checks, heartbeat, hostile input, end to end |
+| `apps/server` | 56 | rooms, delta joins, forwarding, ordering and integrity checks, heartbeat, hostile input, storage contract, restart, storage failures, concurrency (9 of them need PostgreSQL) |
 | `apps/client` | 74 | text diffing, caret shifting, editor session and outbox, reconnect with backoff (fake socket and timers), local storage (memory and IndexedDB), write-ahead saving, reload scenarios against a real server, randomized tests |
 
 ## Roadmap
@@ -45,15 +46,16 @@ Every claim below is backed by a test in this repository.
 - [x] Reconnect with backoff, in-memory outbox, server heartbeat
 - [x] Offline persistence (IndexedDB): document and identity survive reloads
 - [ ] Live cursors anchored to character ids
-- [ ] Persistence (PostgreSQL) and multi-instance fan-out (Redis)
+- [x] Persistence (PostgreSQL)
+- [ ] Multi-instance fan-out (Redis)
 - [ ] Benchmarks against Yjs, tombstone compaction
 - [ ] Demo video and design document
 
 ## Tech Stack
 
-**Used so far:** TypeScript, Node.js, `ws`, Vite, Vitest, fast-check (property-based testing), tsx, IndexedDB (fake-indexeddb in tests), pnpm workspaces, GitHub Actions
+**Used so far:** TypeScript, Node.js, `ws`, Vite, Vitest, fast-check (property-based testing), tsx, IndexedDB (fake-indexeddb in tests), PostgreSQL (`pg`), Docker Compose (the database), pnpm workspaces, GitHub Actions
 
-**Planned:** CodeMirror 6, PostgreSQL, Redis, Docker Compose
+**Planned:** CodeMirror 6, Redis
 
 ## The problem
 
@@ -134,6 +136,9 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 - Each document is capped at 50,000 operations (configurable), which keeps the history sent on join within the client's parse limit.
 - Binary frames are rejected, and `ws` closes any connection that sends more than 64 KB in one frame (close code 1009).
 - A heartbeat pings every connection (30 seconds by default) and terminates one that does not answer, which frees its `siteId` so the client can reconnect.
+- Operations are stored before they are added to memory or forwarded. If the save fails, the sender gets an error and the server closes that connection, because accepting the sender next operation would leave a permanent gap in that site counters. The client reconnects and rejoins from the server vector.
+- A document is loaded from storage on its first join, once, even when several clients join while it is loading. Joins and writes for one document run one at a time, so storage order, memory order and broadcast order are the same, and messages on one connection are handled in order.
+- Stored operations are validated with the same parser as network messages, and each site counters must strictly increase. If they do not, the document is refused rather than served with a gap, because version vectors rely on that order.
 - The server binds to `127.0.0.1` by default, so a development server is not exposed to the network.
 
 ## Offline storage
@@ -224,6 +229,20 @@ The browser saves each document on the device (IndexedDB): the replica identity 
 | Real server: a client types offline, then reloads | Same identity, same text, all its operations in the outbox; syncs to another client and keeps editing |
 | Real server: the server restarts with no state and the client reloads | The new server is rebuilt (3 of 3 operations) and a late joiner sees the text |
 | Real server: everything a client sent or received | Already saved (4 operations, same identity, nothing skipped) |
+| Storage contract (run against memory and PostgreSQL): unknown document | Empty |
+| Storage contract: appended operations, two documents, the same operation appended twice | Returned in order; documents separate; stored once |
+| Storage contract: operations from two sites with interleaved counters | Arrival order kept, not counter order |
+| Storage contract: inserts with and without an origin, and deletes; 300 appends | Returned unchanged and in order |
+| Stored operations with a different property order or extra fields | Normalized to the same form as received ones |
+| Stored data that is not a valid operation, or a site whose counters go backwards or repeat | Refused |
+| A new server on the same storage | Serves the full history, the server vector, and a delta join |
+| After a restart: a gap below the highest stored counter, an exact retry of a stored operation, the same id with other content, a new operation | Gap rejected; retry ignored without a broadcast; conflict rejected; new operation stored and forwarded |
+| PostgreSQL: restart, then a retry of a stored operation (jsonb does not keep key order) | Recognised as the same operation, not a conflict |
+| PostgreSQL: a stored row that is not a valid operation | The document is not served; the connection is closed with code 1011 |
+| Save fails | The sender gets an error and is closed (1011); nothing is stored or forwarded; its next operation is not attempted; the retry after reconnecting works |
+| Load fails | Error and close (1011); the next join loads again |
+| Two clients join while the document is loading | One load |
+| 120 operations from three concurrent writers on a slow, uneven storage | Storage order, memory order and each client received order agree; each site 1 to 40 in order |
 
 ## Fuzz testing
 
@@ -245,7 +264,7 @@ A second failure came from running the same store tests against both an in-memor
 
 ```
 pnpm install
-pnpm test        # 166 tests across four packages
+pnpm test        # 187 run, 9 more with TEST_DATABASE_URL
 pnpm typecheck
 ```
 
@@ -261,7 +280,11 @@ CI runs the install, typecheck and test commands on every push.
 - **The editor binding is a stopgap.** The client works out edits by diffing the textarea value, so typing inside a run of identical characters can attach the new character at the edge of the run instead of where the caret was. The text itself stays correct. Setting the value for a remote edit resets the browser undo history, and carets are shifted by text position rather than anchored to character ids.
 - **A tab that does not own the saved document** (a second tab on the same document, or a browser without IndexedDB) uses a temporary identity and keeps nothing across reloads.
 - **The outbox is only trimmed on rejoin**, so while connected it holds every operation made this session. If the server loses its state while a page stays open, only the operations still in the outbox are resent; a page reload restores all of its own operations from storage and can rebuild the server. Operations from other sites are not resent by a client.
-- **The server keeps everything in memory.** A restart loses all documents, and the number of documents is unbounded.
+- **Documents are loaded fully into memory on first use and never evicted**, up to 50,000 operations each.
+- **One server instance only.** Two instances on one database would each keep their own copy of a room, would not see each other writes, and their ordering checks would drift apart. Fan-out across instances is planned.
+- **PostgreSQL tests only run when `TEST_DATABASE_URL` is set**, and they create and drop temporary schemas in that database. The schema is created with `CREATE ... IF NOT EXISTS`, with no migration tool, and storage inserts one row per operation with no batching.
+- **The storage ignores a second operation with the same key** (the server checks the content first, so this only matters for direct use of the storage).
+- **The database password in `docker-compose.yml` is for local development only.**
 - **The server is a relay and does not check causality.** An operation whose origin or target never arrives is stored and forwarded, and clients will hold it in their pending buffer forever. The pending buffer itself is unbounded.
 - **Counters are only checked to be safe integers.** A malicious client could send a huge counter and push every replica's clock to the limit.
 - **No authentication, permissions, per-connection rate limiting, heartbeat, or `Origin` check.** Any client that can reach the server can read and edit any document it can name.
@@ -282,6 +305,10 @@ CI runs the install, typecheck and test commands on every push.
 - **Deletes get their own operation id**, so every operation is identifiable, which version vectors rely on.
 - **The server enforces per-site increasing order.** That rule is what lets a single counter per site stand for "everything up to here", and it is checked on the server rather than assumed.
 - **One code path for local and remote operations.** Local edits go through the same `integrate` method as remote ones, so the fuzz tests exercise what users actually run.
+- **Storage is an interface with one shared contract suite.** The in-memory and PostgreSQL implementations run the same tests, like the two local stores before them.
+- **One row per operation, keyed by document, site and counter**, with an identity column that records arrival order. Loading a document is a single ordered query.
+- **Save, then broadcast, then close on failure.** Forwarding something that was not stored would let clients see operations the server can lose, and keeping a connection after a failed save would leave a gap.
+- **A damaged document is refused, not repaired.** Skipping a bad operation would break the one-counter-per-site rule that version vectors depend on.
 - **Save before send.** Reusing a `siteId` after a reload is only safe if a counter is never used twice, so operations are saved before they are sent and a failed save stops sending instead of risking a duplicate counter.
 - **Stored data is validated like network input.** It can be old, damaged or edited by hand, so it goes through the same parser as messages from the server. 
 - **Run the same store tests against every implementation.** The in-memory store and IndexedDB share one test suite, which is how the transaction bug above was found. 
@@ -314,6 +341,8 @@ apps/
     src/
       server.ts        WebSocket server: rooms, history, broadcast
       main.ts          entry point (PORT and HOST environment variables)
+      storage.ts       storage interface, in-memory storage, validation of stored data
+      pg-storage.ts    PostgreSQL storage (one row per operation)
       test-helpers.ts  test client
   client/
     index.html         the page
@@ -337,3 +366,11 @@ pnpm --filter @collab/client dev     # http://localhost:5173/?doc=demo (second t
 ```
 
 Set `PORT` and `HOST` to change where it listens. It binds to localhost unless you say otherwise.
+
+Without `DATABASE_URL` documents are kept in memory. To store them in PostgreSQL:
+
+```
+docker compose up -d --wait db     # postgres on 127.0.0.1:5440
+DATABASE_URL=postgres://collab:collab@127.0.0.1:5440/collab pnpm --filter @collab/server dev
+TEST_DATABASE_URL=postgres://collab:collab@127.0.0.1:5440/collab pnpm test   # includes the PostgreSQL tests
+```
