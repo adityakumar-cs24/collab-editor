@@ -136,9 +136,9 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 - Each document is capped at 50,000 operations (configurable), which keeps the history sent on join within the client's parse limit.
 - Binary frames are rejected, and `ws` closes any connection that sends more than 64 KB in one frame (close code 1009).
 - A heartbeat pings every connection (30 seconds by default) and terminates one that does not answer, which frees its `siteId` so the client can reconnect.
-- Operations are stored before they are added to memory or forwarded. If the save fails, the sender gets an error and the server closes that connection, because accepting the sender next operation would leave a permanent gap in that site counters. The client reconnects and rejoins from the server vector.
+- Operations are stored before they are added to memory or forwarded. If the save fails, the sender gets an error and the server closes that connection, because accepting the sender's next operation would leave a permanent gap in that site's counters. The client reconnects and rejoins from the server vector.
 - A document is loaded from storage on its first join, once, even when several clients join while it is loading. Joins and writes for one document run one at a time, so storage order, memory order and broadcast order are the same, and messages on one connection are handled in order.
-- Stored operations are validated with the same parser as network messages, and each site counters must strictly increase. If they do not, the document is refused rather than served with a gap, because version vectors rely on that order.
+- Stored operations are validated with the same parser as network messages, and each site's counters must strictly increase. If they do not, the document is refused rather than served with a gap, because version vectors rely on that order.
 - The server binds to `127.0.0.1` by default, so a development server is not exposed to the network.
 
 ## Offline storage
@@ -146,7 +146,7 @@ Both sides parse incoming messages with the same validators in `packages/protoco
 The browser saves each document on the device (IndexedDB): the replica identity (`siteId`) and every operation sent or received.
 
 - **Write ahead.** An operation this replica creates is saved before it is sent. Saves run one at a time, in order, and the session only sends the saved prefix of its outbox. This is what makes it safe to reuse a `siteId` after a reload: a counter can never be used twice with different content.
-- **Restore.** A reloaded page rebuilds the document from the saved operations. Applying them moves the clock past every counter seen, and the page own operations go back into the outbox, to be trimmed against the server vector on the next join.
+- **Restore.** A reloaded page rebuilds the document from the saved operations. Applying them moves the clock past every counter seen, and the page's own operations go back into the outbox, to be trimmed against the server vector on the next join.
 - **A failed save of its own edit is fatal.** Nothing more is sent and editing is disabled. A failed save of a received change is only reported, because the server can send it again.
 - **Saved data is untrusted.** Records are validated with the same parser as network messages; invalid ones are skipped and counted, and an invalid saved identity is refused.
 - **One tab owns a document.** A Web Lock decides which tab uses the saved identity. Another tab on the same document, or a browser without IndexedDB, runs with a temporary identity and an in-memory store and shows a notice.
@@ -242,7 +242,7 @@ The browser saves each document on the device (IndexedDB): the replica identity 
 | Save fails | The sender gets an error and is closed (1011); nothing is stored or forwarded; its next operation is not attempted; the retry after reconnecting works |
 | Load fails | Error and close (1011); the next join loads again |
 | Two clients join while the document is loading | One load |
-| 120 operations from three concurrent writers on a slow, uneven storage | Storage order, memory order and each client received order agree; each site 1 to 40 in order |
+| 120 operations from three concurrent writers on a slow, uneven storage | Storage order, memory order and each client's received order agree; each site 1 to 40 in order |
 
 ## Fuzz testing
 
@@ -275,13 +275,13 @@ CI runs the install, typecheck and test commands on every push.
 ## Known limitations
 
 - **The Web Lock tab check and the page wiring have no automated browser test.** IndexedDB is tested through `fake-indexeddb`, not a real browser. A browser without Web Locks could run two tabs with the same identity.
-- **A failed save of the page own edit disables editing**, and edits made since then exist only in memory until the page is reloaded.
+- **A failed save of the page's own edit disables editing**, and edits made since then exist only in memory until the page is reloaded.
 - **Local storage grows without bound** (no compaction), and durability follows the browser default. A reconnecting client can briefly be refused because the server still holds its old connection; it retries with backoff, and the heartbeat frees the id (detection takes up to two heartbeat intervals, about 60 seconds by default). A join sends only the operations the client is missing, but a client that knows more than 500 sites falls back to a full replay.
 - **The editor binding is a stopgap.** The client works out edits by diffing the textarea value, so typing inside a run of identical characters can attach the new character at the edge of the run instead of where the caret was. The text itself stays correct. Setting the value for a remote edit resets the browser undo history, and carets are shifted by text position rather than anchored to character ids.
 - **A tab that does not own the saved document** (a second tab on the same document, or a browser without IndexedDB) uses a temporary identity and keeps nothing across reloads.
 - **The outbox is only trimmed on rejoin**, so while connected it holds every operation made this session. If the server loses its state while a page stays open, only the operations still in the outbox are resent; a page reload restores all of its own operations from storage and can rebuild the server. Operations from other sites are not resent by a client.
 - **Documents are loaded fully into memory on first use and never evicted**, up to 50,000 operations each.
-- **One server instance only.** Two instances on one database would each keep their own copy of a room, would not see each other writes, and their ordering checks would drift apart. Fan-out across instances is planned.
+- **One server instance only.** Two instances on one database would each keep their own copy of a room, would not see each other's writes, and their ordering checks would drift apart. Fan-out across instances is planned.
 - **PostgreSQL tests only run when `TEST_DATABASE_URL` is set**, and they create and drop temporary schemas in that database. The schema is created with `CREATE ... IF NOT EXISTS`, with no migration tool, and storage inserts one row per operation with no batching.
 - **The storage ignores a second operation with the same key** (the server checks the content first, so this only matters for direct use of the storage).
 - **The database password in `docker-compose.yml` is for local development only.**
@@ -312,7 +312,7 @@ CI runs the install, typecheck and test commands on every push.
 - **Save before send.** Reusing a `siteId` after a reload is only safe if a counter is never used twice, so operations are saved before they are sent and a failed save stops sending instead of risking a duplicate counter.
 - **Stored data is validated like network input.** It can be old, damaged or edited by hand, so it goes through the same parser as messages from the server. 
 - **Run the same store tests against every implementation.** The in-memory store and IndexedDB share one test suite, which is how the transaction bug above was found. 
-- **Nothing is sent until the server answers the join.** The answer carries the server vector, which says how much of this replica own history the server has, so only the rest is resent. This works because the server enforces per-site order.
+- **Nothing is sent until the server answers the join.** The answer carries the server vector, which says how much of this replica's own history the server has, so only the rest is resent. This works because the server enforces per-site order.
 - **Reconnecting is a small state machine tested with a fake socket and fake timers**, so backoff and ordering are checked without waiting for real time.
 - **Fuzz harness kept outside the test file** so later phases (partitions, offline) can reuse it.
 - **Strict TypeScript** with `noUncheckedIndexedAccess`, because index-heavy data structure code is full of "this element might not exist" bugs.
